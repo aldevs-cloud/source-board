@@ -105,6 +105,8 @@
   .notice h2 { margin: 0 0 8px; }
   .notice p { color: var(--muted); margin: 0 0 16px; }
   .notice code { background: var(--bg); padding: 2px 6px; border-radius: 6px; font-size: 13px; }
+  .notice.lock { max-width: 420px; }
+  .notice.lock .btn { width: 100%; justify-content: center; margin-top: 4px; }
   .loading { padding: 80px 0; text-align: center; color: var(--muted); }
 
   .overlay { position: fixed; inset: 0; background: rgba(10,16,30,.5); display: grid; place-items: center; padding: 16px; z-index: 50; }
@@ -155,9 +157,14 @@
     <ul class="plist" id="plist"></ul>
     <div class="side-foot">
       <span id="stats"></span>
-      <button class="icon-btn" id="themeBtn" aria-label="Switch theme" title="Switch theme">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
-      </button>
+      <span>
+        <button class="icon-btn" id="lockBtn" aria-label="Lock" title="Lock (forget passcode on this device)">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+        </button>
+        <button class="icon-btn" id="themeBtn" aria-label="Switch theme" title="Switch theme">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+        </button>
+      </span>
     </div>
   </aside>
   <div class="scrim" id="scrim"></div>
@@ -176,23 +183,27 @@
 <script>
 (function () {
   /* ===== 1) SUPABASE CONFIG: paste your own values here ===== */
-  var SUPABASE_URL = 'PASTE_YOUR_PROJECT_URL_HERE';       // e.g. https://abcdxyz.supabase.co
-  var SUPABASE_ANON_KEY = 'PASTE_YOUR_ANON_KEY_HERE';     // Project Settings > API > anon public key
+  var SUPABASE_URL = 'https://dlgrldoqkkflenecdnoc.supabase.co';       // e.g. https://abcdxyz.supabase.co
+  var SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRsZ3JsZG9xa2tmbGVuZWNkbm9jIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTA1NDE1OTAsImV4cCI6MjEwNjExNzU5MH0.SRrwibUlg5L8rwTmJCpzZTluSzRiA3IRZTB9s-8UEIc';     // Project Settings > API > anon public key
   /* ========================================================= */
 
   var configured = SUPABASE_URL.indexOf('http') === 0 && SUPABASE_ANON_KEY.indexOf('PASTE') !== 0;
-  var state = { projects: [], loaded: false, error: '' };
+  var PASS_KEY = 'source-board-passcode';
+  var state = { projects: [], loaded: false, error: '', passcode: '', locked: true, lockMsg: '' };
+  try { state.passcode = localStorage.getItem(PASS_KEY) || ''; } catch (e) {}
+  state.locked = !state.passcode;
   var lastSnapshot = '';
 
   /* ---------- API (plain fetch to Supabase REST) ---------- */
   function api(path, method, body) {
-    var headers = { apikey: SUPABASE_ANON_KEY, Authorization: 'Bearer ' + SUPABASE_ANON_KEY, 'Content-Type': 'application/json' };
+    var headers = { apikey: SUPABASE_ANON_KEY, Authorization: 'Bearer ' + SUPABASE_ANON_KEY, 'Content-Type': 'application/json', 'x-team-passcode': state.passcode };
     if (method === 'POST' || method === 'PATCH') headers.Prefer = 'return=representation';
     return fetch(SUPABASE_URL.replace(/\/$/, '') + '/rest/v1/' + path, {
       method: method || 'GET', headers: headers, body: body ? JSON.stringify(body) : undefined
     }).then(function (res) {
       if (!res.ok) {
         return res.json().catch(function () { return {}; }).then(function (j) {
+          if (res.status === 401 || res.status === 403) throw new Error('Access denied. Lock and unlock again with the current passcode.');
           throw new Error(j.message || ('Request failed (' + res.status + ')'));
         });
       }
@@ -202,18 +213,45 @@
   }
 
   function loadData(silent) {
-    return api('projects?select=*,sources(*)&order=created_at.asc&sources.order=created_at.desc').then(function (rows) {
-      var snap = JSON.stringify(rows);
-      state.loaded = true; state.error = '';
-      if (snap === lastSnapshot && silent) return;
-      lastSnapshot = snap;
-      state.projects = rows || [];
-      render();
+    if (state.locked) return Promise.resolve();
+    // The server decides whether the passcode is right; this only asks it.
+    return api('rpc/has_valid_passcode', 'POST', {}).then(function (ok) {
+      if (ok !== true) { lockApp('The passcode is no longer valid. Enter it again.'); return; }
+      return api('projects?select=*,sources(*)&order=created_at.asc&sources.order=created_at.desc').then(function (rows) {
+        var snap = JSON.stringify(rows);
+        state.loaded = true; state.error = '';
+        if (snap === lastSnapshot && silent) return;
+        lastSnapshot = snap;
+        state.projects = rows || [];
+        render();
+      });
     }).catch(function (e) {
       if (silent && state.loaded) return;
       state.loaded = true; state.error = e.message || 'Could not load data.';
       render();
     });
+  }
+
+  function lockApp(msg) {
+    state.passcode = ''; state.locked = true; state.projects = []; lastSnapshot = ''; state.error = '';
+    state.lockMsg = msg || '';
+    try { localStorage.removeItem(PASS_KEY); } catch (e) {}
+    if (location.hash) location.hash = '';
+    render();
+  }
+  function tryUnlock(value) {
+    state.passcode = value;
+    return api('rpc/has_valid_passcode', 'POST', {}).then(function (ok) {
+      if (ok === true) {
+        try { localStorage.setItem(PASS_KEY, value); } catch (e) {}
+        state.locked = false; state.lockMsg = ''; state.loaded = false; state.error = '';
+        render();
+        loadData();
+        return true;
+      }
+      state.passcode = '';
+      return false;
+    }).catch(function (e) { state.passcode = ''; throw e; });
   }
 
   /* ---------- Routing (#/p/<id>) so browser Back works and links can be shared ---------- */
@@ -317,6 +355,7 @@
 
   /* ---------- Actions (all saved to Supabase) ---------- */
   function addProject() {
+    if (state.locked) return;
     openModal({
       title: 'Add project', hint: 'Give your project a name. You can rename it later.', submit: 'Add project',
       fields: [{ name: 'name', label: 'Project name', required: true, placeholder: 'e.g. Malware detection thesis' }],
@@ -375,7 +414,7 @@
     var cur = activeId();
     document.getElementById('homeBtn').setAttribute('aria-current', String(!cur));
     if (!state.projects.length) {
-      list.appendChild(h('li', { class: 'side-empty', text: state.loaded ? 'No projects yet.' : 'Loading...' }));
+      list.appendChild(h('li', { class: 'side-empty', text: state.locked ? 'Locked' : (state.loaded ? 'No projects yet.' : 'Loading...') }));
     } else {
       state.projects.forEach(function (p) {
         list.appendChild(h('li', {}, [h('button', { class: 'pitem', 'aria-current': String(p.id === cur), onclick: function () { goProject(p.id); } }, [
@@ -384,7 +423,9 @@
       });
     }
     var total = state.projects.reduce(function (n, p) { return n + p.sources.length; }, 0);
-    document.getElementById('stats').textContent = plural(state.projects.length, 'project') + ', ' + plural(total, 'source');
+    document.getElementById('stats').textContent = state.locked ? '' : plural(state.projects.length, 'project') + ', ' + plural(total, 'source');
+    document.getElementById('sideAdd').style.visibility = state.locked ? 'hidden' : 'visible';
+    document.getElementById('lockBtn').style.display = state.locked ? 'none' : 'inline-grid';
   }
 
   function renderSetup(view) {
@@ -393,6 +434,31 @@
       h('p', { text: 'Open index.html and paste your Project URL and anon key at the top of the script.' }),
       h('p', {}, ['Look for ', h('code', { text: 'SUPABASE_URL' }), ' and ', h('code', { text: 'SUPABASE_ANON_KEY' }), '.'])
     ]));
+  }
+  function renderLock(view) {
+    var input = h('input', { type: 'password', id: 'passInput', placeholder: 'Team passcode', autocomplete: 'current-password' });
+    var err = h('div', { class: 'err', role: 'alert', text: state.lockMsg || '' });
+    var btn = h('button', { type: 'submit', class: 'btn primary big', text: 'Unlock' });
+    function reset(msg) { btn.disabled = false; btn.textContent = 'Unlock'; err.textContent = msg; }
+    var form = h('form', { novalidate: 'novalidate', onsubmit: function (e) {
+      e.preventDefault();
+      var v = input.value;
+      if (!v) { err.textContent = 'Enter the team passcode.'; input.focus(); return; }
+      if (!/^[\x20-\x7E]+$/.test(v)) { err.textContent = 'The passcode only uses standard letters, numbers and symbols.'; input.select(); return; }
+      btn.disabled = true; btn.textContent = 'Checking...'; err.textContent = '';
+      tryUnlock(v).then(function (ok) {
+        if (!ok) { reset('Wrong passcode. Try again.'); input.select(); }
+      }).catch(function (e2) { reset('Could not check the passcode: ' + (e2 && e2.message ? e2.message : 'no connection')); });
+    } }, [
+      h('div', { class: 'field' }, [h('label', { for: 'passInput', text: 'Passcode' }), input, err]),
+      btn
+    ]);
+    view.appendChild(h('div', { class: 'notice lock' }, [
+      h('h2', { text: 'Enter the team passcode' }),
+      h('p', { text: 'Ask the project owner for the passcode to view and edit sources.' }),
+      form
+    ]));
+    setTimeout(function () { input.focus(); }, 0);
   }
   function renderError(view) {
     view.appendChild(h('div', { class: 'notice' }, [
@@ -459,6 +525,7 @@
     renderSide();
     var view = document.getElementById('view'); view.innerHTML = '';
     if (!configured) return renderSetup(view);
+    if (state.locked) return renderLock(view);
     if (state.error) return renderError(view);
     if (!state.loaded) { view.appendChild(h('div', { class: 'loading', text: 'Loading your projects...' })); return; }
     var p = active();
@@ -473,6 +540,7 @@
   document.getElementById('sideAdd').addEventListener('click', addProject);
   document.getElementById('homeBtn').addEventListener('click', goHome);
   document.getElementById('brandBtn').addEventListener('click', goHome);
+  document.getElementById('lockBtn').addEventListener('click', function () { lockApp(''); closeSide(); });
   document.getElementById('themeBtn').addEventListener('click', function () {
     var root = document.documentElement;
     var dark = root.getAttribute('data-theme') === 'dark' || (!root.getAttribute('data-theme') && window.matchMedia('(prefers-color-scheme: dark)').matches);
@@ -483,12 +551,12 @@
 
   // Teammates' changes show up automatically
   if (configured) {
-    setInterval(function () { if (!document.hidden && !document.querySelector('.overlay')) loadData(true); }, 15000);
-    document.addEventListener('visibilitychange', function () { if (!document.hidden && !document.querySelector('.overlay')) loadData(true); });
+    setInterval(function () { if (!document.hidden && !state.locked && !document.querySelector('.overlay')) loadData(true); }, 15000);
+    document.addEventListener('visibilitychange', function () { if (!document.hidden && !state.locked && !document.querySelector('.overlay')) loadData(true); });
   }
 
   render();
-  if (configured) loadData();
+  if (configured && !state.locked) loadData();
 })();
 </script>
 </body>
